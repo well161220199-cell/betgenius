@@ -1,28 +1,67 @@
-// ═══════════════════════════════════════════════════════
-// CACHE — salva resultados por 3 horas
-// ═══════════════════════════════════════════════════════
-const cache = new Map();
-const CACHE_TTL = 3 * 60 * 60 * 1000;
+import { createClient } from "@supabase/supabase-js";
 
-function getFromCache(key) {
-  const entry = cache.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.timestamp > CACHE_TTL) {
-    cache.delete(key);
+// ═══════════════════════════════════════════════════════
+// SUPABASE CLIENT
+// ═══════════════════════════════════════════════════════
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+);
+
+// ═══════════════════════════════════════════════════════
+// CACHE NO SUPABASE — compartilhado entre dispositivos
+// ═══════════════════════════════════════════════════════
+const CACHE_TTL_HOURS = 3;
+
+async function getFromCache(marketId, date) {
+  try {
+    const cacheId = `${marketId}::${date}`;
+    const cutoff = new Date(Date.now() - CACHE_TTL_HOURS * 60 * 60 * 1000).toISOString();
+
+    const { data, error } = await supabase
+      .from("predictions_cache")
+      .select("predictions")
+      .eq("id", cacheId)
+      .gt("created_at", cutoff)
+      .single();
+
+    if (error || !data) return null;
+    return data.predictions;
+  } catch {
     return null;
   }
-  return entry.data;
 }
 
-function setCache(key, data) {
-  if (cache.size > 200) {
-    cache.delete(cache.keys().next().value);
+async function setCache(marketId, date, predictions) {
+  try {
+    const cacheId = `${marketId}::${date}`;
+    await supabase
+      .from("predictions_cache")
+      .upsert({
+        id: cacheId,
+        market_id: marketId,
+        date: date,
+        predictions: predictions,
+        created_at: new Date().toISOString(),
+      });
+  } catch (err) {
+    console.error("[CACHE WRITE ERROR]", err.message);
   }
-  cache.set(key, { data, timestamp: Date.now() });
+}
+
+// Limpar cache velho (roda de vez em quando)
+async function cleanOldCache() {
+  try {
+    const cutoff = new Date(Date.now() - CACHE_TTL_HOURS * 60 * 60 * 1000).toISOString();
+    await supabase
+      .from("predictions_cache")
+      .delete()
+      .lt("created_at", cutoff);
+  } catch {}
 }
 
 // ═══════════════════════════════════════════════════════
-// RATE LIMITER — máximo 8 req/min (limite free = 15)
+// RATE LIMITER — máximo 8 req/min
 // ═══════════════════════════════════════════════════════
 const requestTimes = [];
 
@@ -35,7 +74,7 @@ function canMakeRequest() {
 }
 
 // ═══════════════════════════════════════════════════════
-// MODELOS — tenta na ordem, se um falhar vai pro próximo
+// MODELOS + ROTAÇÃO DE CHAVES
 // ═══════════════════════════════════════════════════════
 const MODELS = [
   "gemini-2.0-flash",
@@ -43,42 +82,29 @@ const MODELS = [
   "gemini-2.0-flash-lite",
 ];
 
-// ═══════════════════════════════════════════════════════
-// ROTAÇÃO DE CHAVES (opcional — adicione GEMINI_API_KEY_2 e _3 no Vercel)
-// ═══════════════════════════════════════════════════════
 let keyIndex = 0;
 
-function getNextApiKey() {
-  const keys = [
+function getApiKeys() {
+  return [
     process.env.GEMINI_API_KEY,
     process.env.GEMINI_API_KEY_2,
     process.env.GEMINI_API_KEY_3,
   ].filter(Boolean);
-  if (keys.length === 0) return null;
-  const key = keys[keyIndex % keys.length];
-  keyIndex++;
-  return key;
 }
 
 // ═══════════════════════════════════════════════════════
-// CHAMAR GEMINI COM RETRY AUTOMÁTICO
+// CHAMAR GEMINI COM RETRY
 // ═══════════════════════════════════════════════════════
 async function callGemini(prompt) {
-  const keys = [
-    process.env.GEMINI_API_KEY,
-    process.env.GEMINI_API_KEY_2,
-    process.env.GEMINI_API_KEY_3,
-  ].filter(Boolean);
-
+  const keys = getApiKeys();
   const maxAttempts = MODELS.length * keys.length;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const model = MODELS[attempt % MODELS.length];
     const apiKey = keys[Math.floor(attempt / MODELS.length) % keys.length] || keys[0];
-
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-    console.log(`[TENTATIVA ${attempt + 1}/${maxAttempts}] Modelo: ${model}`);
+    console.log(`[TENTATIVA ${attempt + 1}/${maxAttempts}] ${model}`);
 
     try {
       const res = await fetch(url, {
@@ -94,10 +120,9 @@ async function callGemini(prompt) {
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         console.error(`[ERRO] ${model}: ${res.status} - ${err?.error?.message || "?"}`);
-
         if (res.status === 429 || res.status === 503) {
           await new Promise(r => setTimeout(r, 2000));
-          continue; // tenta próximo modelo/chave
+          continue;
         }
         throw new Error(`Erro ${res.status}: ${err?.error?.message || "Erro desconhecido"}`);
       }
@@ -109,12 +134,10 @@ async function callGemini(prompt) {
           if (part.text) text += part.text;
         }
       }
-
-      if (!text) { continue; }
+      if (!text) continue;
 
       console.log(`[OK] ${model} — ${text.length} chars`);
       return text;
-
     } catch (error) {
       if (error.message.startsWith("Erro ")) throw error;
       console.error(`[REDE] ${model}:`, error.message);
@@ -133,15 +156,14 @@ export async function POST(request) {
   try {
     const { marketId, marketLabel, marketDesc, date } = await request.json();
 
-    // 1. CACHE — retorna instantâneo se já tem
-    const cacheKey = `${marketId}::${date}`;
-    const cached = getFromCache(cacheKey);
+    // 1. CACHE DO SUPABASE
+    const cached = await getFromCache(marketId, date);
     if (cached) {
-      console.log(`[CACHE HIT] ${cacheKey}`);
+      console.log(`[CACHE HIT] ${marketId}::${date}`);
       return Response.json({ predictions: cached, fromCache: true });
     }
 
-    // 2. RATE LIMIT — protege contra excesso
+    // 2. RATE LIMIT
     if (!canMakeRequest()) {
       return Response.json(
         { error: "⏳ Aguarde 30 segundos antes de consultar outro mercado." },
@@ -149,6 +171,8 @@ export async function POST(request) {
       );
     }
     requestTimes.push(Date.now());
+
+    console.log(`[CACHE MISS] ${marketId}::${date} — chamando API...`);
 
     // 3. PROMPT
     const prompt = `Você é um analista especialista em apostas esportivas de futebol. Sua tarefa é analisar os jogos de futebol reais que acontecem na data ${date} e avaliar quais têm a maior probabilidade para o mercado "${marketLabel}" (${marketDesc}).
@@ -185,10 +209,10 @@ Regras:
 - Cada item de analysis deve conter dados/estatísticas reais
 - Retorne SOMENTE o JSON`;
 
-    // 4. CHAMAR API (com retry automático)
+    // 4. CHAMAR API
     const text = await callGemini(prompt);
 
-    // 5. PARSEAR RESPOSTA
+    // 5. PARSEAR
     let clean = text.trim().replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
     let predictions;
 
@@ -229,9 +253,12 @@ Regras:
       })
       .sort((a, b) => b.chance - a.chance);
 
-    // 6. SALVAR NO CACHE
-    setCache(cacheKey, predictions);
-    console.log(`[CACHE SET] ${cacheKey} — ${predictions.length} jogos (expira em 3h)`);
+    // 6. SALVAR NO SUPABASE
+    await setCache(marketId, date, predictions);
+    console.log(`[CACHE SET] ${marketId}::${date} — ${predictions.length} jogos`);
+
+    // 7. LIMPAR CACHE VELHO (1 em cada 10 requests)
+    if (Math.random() < 0.1) cleanOldCache();
 
     return Response.json({ predictions });
   } catch (error) {
