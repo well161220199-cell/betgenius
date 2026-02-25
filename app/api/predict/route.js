@@ -1,6 +1,45 @@
+// ═══════════════════════════════════════════════════════
+// SERVER-SIDE CACHE — Evita chamadas repetidas à API
+// ═══════════════════════════════════════════════════════
+const cache = new Map();
+const CACHE_TTL = 3 * 60 * 60 * 1000; // 3 horas em ms
+
+function getCacheKey(marketId, date) {
+  return `${marketId}::${date}`;
+}
+
+function getFromCache(key) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > CACHE_TTL) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCache(key, data) {
+  // Limitar cache a 200 entradas para não estourar memória
+  if (cache.size > 200) {
+    const oldest = cache.keys().next().value;
+    cache.delete(oldest);
+  }
+  cache.set(key, { data, timestamp: Date.now() });
+}
+
 export async function POST(request) {
   try {
     const { marketId, marketLabel, marketDesc, date } = await request.json();
+
+    // 1. Verificar cache primeiro!
+    const cacheKey = getCacheKey(marketId, date);
+    const cached = getFromCache(cacheKey);
+    if (cached) {
+      console.log(`[CACHE HIT] ${cacheKey} — economia de 1 chamada API`);
+      return Response.json({ predictions: cached, fromCache: true });
+    }
+
+    console.log(`[CACHE MISS] ${cacheKey} — chamando Gemini API...`);
 
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
@@ -134,6 +173,10 @@ Regras:
         };
       })
       .sort(function (a, b) { return b.chance - a.chance; });
+
+    // 2. Salvar no cache!
+    setCache(cacheKey, predictions);
+    console.log(`[CACHE SET] ${cacheKey} — ${predictions.length} jogos salvos (expira em 3h)`);
 
     return Response.json({ predictions });
   } catch (error) {

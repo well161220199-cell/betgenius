@@ -313,11 +313,21 @@ function Dashboard({ user, onLogout }) {
   const [expanded, setExpanded] = useState(null);
   const [loading, setLoading] = useState(false);
   const [preds, setPreds] = useState([]);
-  const [allPreds, setAllPreds] = useState({}); // cache for best markets
+  const [allPreds, setAllPreds] = useState({}); // cache: "marketId-dateOff" -> predictions
   const [error, setError] = useState(null);
   const [toast, setToast] = useState(null);
 
   const fetchPredictions = useCallback(async (mktId, dayOff) => {
+    const cacheKey = mktId + "-" + dayOff;
+
+    // Check cache first - avoid repeated API calls!
+    if (allPreds[cacheKey] && allPreds[cacheKey].length > 0) {
+      setPreds(allPreds[cacheKey]);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     setExpanded(null);
     setError(null);
@@ -344,9 +354,10 @@ function Dashboard({ user, onLogout }) {
         setPreds([]);
       } else {
         setPreds(data.predictions || []);
-        // Cache for best markets
+        // Cache predictions by market+date
         setAllPreds(prev => ({
           ...prev,
+          [cacheKey]: data.predictions || [],
           [mktId]: data.predictions || [],
         }));
       }
@@ -356,7 +367,7 @@ function Dashboard({ user, onLogout }) {
     }
 
     setLoading(false);
-  }, []);
+  }, [allPreds]);
 
   useEffect(() => {
     fetchPredictions(market, dateOff);
