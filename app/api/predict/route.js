@@ -1,12 +1,8 @@
 // ═══════════════════════════════════════════════════════
-// SERVER-SIDE CACHE — Evita chamadas repetidas à API
+// CACHE — salva resultados por 3 horas
 // ═══════════════════════════════════════════════════════
 const cache = new Map();
-const CACHE_TTL = 3 * 60 * 60 * 1000; // 3 horas em ms
-
-function getCacheKey(marketId, date) {
-  return `${marketId}::${date}`;
-}
+const CACHE_TTL = 3 * 60 * 60 * 1000;
 
 function getFromCache(key) {
   const entry = cache.get(key);
@@ -19,33 +15,142 @@ function getFromCache(key) {
 }
 
 function setCache(key, data) {
-  // Limitar cache a 200 entradas para não estourar memória
   if (cache.size > 200) {
-    const oldest = cache.keys().next().value;
-    cache.delete(oldest);
+    cache.delete(cache.keys().next().value);
   }
   cache.set(key, { data, timestamp: Date.now() });
 }
 
+// ═══════════════════════════════════════════════════════
+// RATE LIMITER — máximo 8 req/min (limite free = 15)
+// ═══════════════════════════════════════════════════════
+const requestTimes = [];
+
+function canMakeRequest() {
+  const now = Date.now();
+  while (requestTimes.length > 0 && now - requestTimes[0] > 60000) {
+    requestTimes.shift();
+  }
+  return requestTimes.length < 8;
+}
+
+// ═══════════════════════════════════════════════════════
+// MODELOS — tenta na ordem, se um falhar vai pro próximo
+// ═══════════════════════════════════════════════════════
+const MODELS = [
+  "gemini-2.0-flash",
+  "gemini-2.5-flash",
+  "gemini-1.5-flash",
+];
+
+// ═══════════════════════════════════════════════════════
+// ROTAÇÃO DE CHAVES (opcional — adicione GEMINI_API_KEY_2 e _3 no Vercel)
+// ═══════════════════════════════════════════════════════
+let keyIndex = 0;
+
+function getNextApiKey() {
+  const keys = [
+    process.env.GEMINI_API_KEY,
+    process.env.GEMINI_API_KEY_2,
+    process.env.GEMINI_API_KEY_3,
+  ].filter(Boolean);
+  if (keys.length === 0) return null;
+  const key = keys[keyIndex % keys.length];
+  keyIndex++;
+  return key;
+}
+
+// ═══════════════════════════════════════════════════════
+// CHAMAR GEMINI COM RETRY AUTOMÁTICO
+// ═══════════════════════════════════════════════════════
+async function callGemini(prompt) {
+  const keys = [
+    process.env.GEMINI_API_KEY,
+    process.env.GEMINI_API_KEY_2,
+    process.env.GEMINI_API_KEY_3,
+  ].filter(Boolean);
+
+  const maxAttempts = MODELS.length * keys.length;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const model = MODELS[attempt % MODELS.length];
+    const apiKey = keys[Math.floor(attempt / MODELS.length) % keys.length] || keys[0];
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    console.log(`[TENTATIVA ${attempt + 1}/${maxAttempts}] Modelo: ${model}`);
+
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          tools: [{ googleSearch: {} }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        console.error(`[ERRO] ${model}: ${res.status} - ${err?.error?.message || "?"}`);
+
+        if (res.status === 429 || res.status === 503) {
+          await new Promise(r => setTimeout(r, 2000));
+          continue; // tenta próximo modelo/chave
+        }
+        throw new Error(`Erro ${res.status}: ${err?.error?.message || "Erro desconhecido"}`);
+      }
+
+      const data = await res.json();
+      let text = "";
+      if (data.candidates?.[0]?.content?.parts) {
+        for (const part of data.candidates[0].content.parts) {
+          if (part.text) text += part.text;
+        }
+      }
+
+      if (!text) { continue; }
+
+      console.log(`[OK] ${model} — ${text.length} chars`);
+      return text;
+
+    } catch (error) {
+      if (error.message.startsWith("Erro ")) throw error;
+      console.error(`[REDE] ${model}:`, error.message);
+      await new Promise(r => setTimeout(r, 1000));
+      continue;
+    }
+  }
+
+  throw new Error("Todos os modelos estão indisponíveis. Tente em alguns minutos.");
+}
+
+// ═══════════════════════════════════════════════════════
+// ENDPOINT PRINCIPAL
+// ═══════════════════════════════════════════════════════
 export async function POST(request) {
   try {
     const { marketId, marketLabel, marketDesc, date } = await request.json();
 
-    // 1. Verificar cache primeiro!
-    const cacheKey = getCacheKey(marketId, date);
+    // 1. CACHE — retorna instantâneo se já tem
+    const cacheKey = `${marketId}::${date}`;
     const cached = getFromCache(cacheKey);
     if (cached) {
-      console.log(`[CACHE HIT] ${cacheKey} — economia de 1 chamada API`);
+      console.log(`[CACHE HIT] ${cacheKey}`);
       return Response.json({ predictions: cached, fromCache: true });
     }
 
-    console.log(`[CACHE MISS] ${cacheKey} — chamando Gemini API...`);
-
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      return Response.json({ error: "GEMINI_API_KEY não configurada" }, { status: 500 });
+    // 2. RATE LIMIT — protege contra excesso
+    if (!canMakeRequest()) {
+      return Response.json(
+        { error: "⏳ Aguarde 30 segundos antes de consultar outro mercado." },
+        { status: 429 }
+      );
     }
+    requestTimes.push(Date.now());
 
+    // 3. PROMPT
     const prompt = `Você é um analista especialista em apostas esportivas de futebol. Sua tarefa é analisar os jogos de futebol reais que acontecem na data ${date} e avaliar quais têm a maior probabilidade para o mercado "${marketLabel}" (${marketDesc}).
 
 INSTRUÇÕES:
@@ -80,81 +185,31 @@ Regras:
 - Cada item de analysis deve conter dados/estatísticas reais
 - Retorne SOMENTE o JSON`;
 
-    const geminiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey;
+    // 4. CHAMAR API (com retry automático)
+    const text = await callGemini(prompt);
 
-    const res = await fetch(geminiUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }],
-          },
-        ],
-        tools: [
-          {
-            googleSearch: {},
-          },
-        ],
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 8192,
-        },
-      }),
-    });
-
-    if (!res.ok) {
-      const errData = await res.json().catch(function () { return {}; });
-      console.error("Gemini API error:", res.status, errData);
-      return Response.json(
-        { error: "Erro na API Gemini: " + res.status + " - " + (errData?.error?.message || "Erro desconhecido") },
-        { status: 500 }
-      );
-    }
-
-    const data = await res.json();
-
-    let text = "";
-    if (data.candidates && data.candidates[0] && data.candidates[0].content) {
-      for (const part of data.candidates[0].content.parts) {
-        if (part.text) {
-          text += part.text;
-        }
-      }
-    }
-
-    if (!text) {
-      return Response.json({ error: "A IA não retornou dados" }, { status: 500 });
-    }
-
-    text = text.trim();
-    text = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-
+    // 5. PARSEAR RESPOSTA
+    let clean = text.trim().replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
     let predictions;
+
     try {
-      predictions = JSON.parse(text);
+      predictions = JSON.parse(clean);
     } catch (e) {
-      const match = text.match(/\[[\s\S]*\]/);
+      const match = clean.match(/\[[\s\S]*\]/);
       if (match) {
         predictions = JSON.parse(match[0]);
       } else {
-        console.error("Failed to parse:", text.substring(0, 500));
-        return Response.json(
-          { error: "Erro ao processar resposta da IA" },
-          { status: 500 }
-        );
+        console.error("Parse failed:", clean.substring(0, 300));
+        return Response.json({ error: "Erro ao processar resposta da IA" }, { status: 500 });
       }
     }
 
-    if (!Array.isArray(predictions)) {
-      predictions = [];
-    }
+    if (!Array.isArray(predictions)) predictions = [];
 
     predictions = predictions
-      .filter(function (p) { return p.home && p.away && p.chance; })
-      .map(function (p, i) {
-        var chance = Math.min(95, Math.max(55, Number(p.chance) || 65));
+      .filter(p => p.home && p.away && p.chance)
+      .map((p, i) => {
+        const chance = Math.min(95, Math.max(55, Number(p.chance) || 65));
         return {
           id: marketId + "-" + i,
           home: p.home || "Time A",
@@ -162,7 +217,7 @@ Regras:
           league: p.league || "Liga",
           flag: p.flag || "⚽",
           time: p.time || "00:00",
-          chance: chance,
+          chance,
           conf: chance >= 82 ? "alta" : chance >= 70 ? "media" : "normal",
           analysis: Array.isArray(p.analysis) ? p.analysis.slice(0, 4) : [
             "Análise baseada em dados estatísticos",
@@ -172,11 +227,11 @@ Regras:
           ],
         };
       })
-      .sort(function (a, b) { return b.chance - a.chance; });
+      .sort((a, b) => b.chance - a.chance);
 
-    // 2. Salvar no cache!
+    // 6. SALVAR NO CACHE
     setCache(cacheKey, predictions);
-    console.log(`[CACHE SET] ${cacheKey} — ${predictions.length} jogos salvos (expira em 3h)`);
+    console.log(`[CACHE SET] ${cacheKey} — ${predictions.length} jogos (expira em 3h)`);
 
     return Response.json({ predictions });
   } catch (error) {
