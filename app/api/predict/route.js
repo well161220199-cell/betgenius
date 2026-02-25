@@ -100,11 +100,12 @@ async function callGemini(prompt) {
   const maxAttempts = MODELS.length * keys.length;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const model = MODELS[attempt % MODELS.length];
-    const apiKey = keys[Math.floor(attempt / MODELS.length) % keys.length] || keys[0];
+    // Tenta todas as chaves com cada modelo antes de trocar modelo
+    const model = MODELS[Math.floor(attempt / keys.length) % MODELS.length];
+    const apiKey = keys[attempt % keys.length];
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-    console.log(`[TENTATIVA ${attempt + 1}/${maxAttempts}] ${model}`);
+    console.log(`[TENTATIVA ${attempt + 1}/${maxAttempts}] ${model} | chave ${(attempt % keys.length) + 1}`);
 
     try {
       const res = await fetch(url, {
@@ -119,12 +120,11 @@ async function callGemini(prompt) {
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        console.error(`[ERRO] ${model}: ${res.status} - ${err?.error?.message || "?"}`);
-        if (res.status === 429 || res.status === 503) {
-          await new Promise(r => setTimeout(r, 2000));
-          continue;
-        }
-        throw new Error(`Erro ${res.status}: ${err?.error?.message || "Erro desconhecido"}`);
+        console.error(`[ERRO] ${model} key${Math.floor(attempt / MODELS.length)}: ${res.status} - ${err?.error?.message || "?"}`);
+        // Qualquer erro → tenta próximo modelo/chave
+        const wait = res.status === 429 ? 3000 : 1000;
+        await new Promise(r => setTimeout(r, wait));
+        continue;
       }
 
       const data = await res.json();
@@ -172,7 +172,7 @@ export async function POST(request) {
     }
     requestTimes.push(Date.now());
 
-    console.log(`[CACHE MISS] ${marketId}::${date} — chamando API...`);
+    console.log(`[CACHE MISS] ${marketId}::${date} — chamando API... (${getApiKeys().length} chaves, ${MODELS.length} modelos)`);
 
     // 3. PROMPT
     const prompt = `Você é um analista especialista em apostas esportivas de futebol. Sua tarefa é analisar os jogos de futebol reais que acontecem na data ${date} e avaliar quais têm a maior probabilidade para o mercado "${marketLabel}" (${marketDesc}).
