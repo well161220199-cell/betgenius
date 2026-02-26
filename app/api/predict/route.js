@@ -9,23 +9,41 @@ const supabase = createClient(
 );
 
 // ═══════════════════════════════════════════════════════
-// CACHE NO SUPABASE — compartilhado entre dispositivos
+// HORÁRIO DE BRASÍLIA
 // ═══════════════════════════════════════════════════════
-const CACHE_TTL_HOURS = 3;
+function getBrasiliaTime() {
+  const now = new Date();
+  const brasiliaOffset = -3 * 60;
+  return new Date(now.getTime() + (now.getTimezoneOffset() + brasiliaOffset) * 60000);
+}
 
+// ═══════════════════════════════════════════════════════
+// CACHE NO SUPABASE — válido até o fim do dia
+// ═══════════════════════════════════════════════════════
 async function getFromCache(marketId, date) {
   try {
     const cacheId = `${marketId}::${date}`;
-    const cutoff = new Date(Date.now() - CACHE_TTL_HOURS * 60 * 60 * 1000).toISOString();
-
     const { data, error } = await supabase
       .from("predictions_cache")
-      .select("predictions")
+      .select("predictions, created_at")
       .eq("id", cacheId)
-      .gt("created_at", cutoff)
       .single();
 
     if (error || !data) return null;
+
+    // Verificar se o cache é do mesmo dia (horário de Brasília)
+    const brasilia = getBrasiliaTime();
+    const todayStr = brasilia.toISOString().split("T")[0];
+    const cacheCreated = new Date(data.created_at);
+    const cacheBrasilia = new Date(cacheCreated.getTime() + (cacheCreated.getTimezoneOffset() + (-3 * 60)) * 60000);
+    const cacheDayStr = cacheBrasilia.toISOString().split("T")[0];
+
+    if (cacheDayStr !== todayStr) {
+      // Cache de outro dia → deletar
+      await supabase.from("predictions_cache").delete().eq("id", cacheId);
+      return null;
+    }
+
     return data.predictions;
   } catch {
     return null;
@@ -49,15 +67,33 @@ async function setCache(marketId, date, predictions) {
   }
 }
 
-// Limpar cache velho (roda de vez em quando)
 async function cleanOldCache() {
   try {
-    const cutoff = new Date(Date.now() - CACHE_TTL_HOURS * 60 * 60 * 1000).toISOString();
-    await supabase
-      .from("predictions_cache")
-      .delete()
-      .lt("created_at", cutoff);
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    await supabase.from("predictions_cache").delete().lt("created_at", yesterday);
   } catch {}
+}
+
+// ═══════════════════════════════════════════════════════
+// FILTRAR JOGOS PASSADOS — só mostra jogos futuros
+// ═══════════════════════════════════════════════════════
+function filterFutureGames(predictions, date) {
+  const brasilia = getBrasiliaTime();
+  const todayStr = brasilia.toISOString().split("T")[0];
+
+  // Se a data NÃO é hoje, retorna todos (amanhã, depois, etc.)
+  if (date !== todayStr) return predictions;
+
+  // Se é hoje, filtra só jogos que ainda não começaram
+  const currentHour = brasilia.getHours();
+  const currentMin = brasilia.getMinutes();
+
+  return predictions.filter(game => {
+    if (!game.time || !game.time.includes(":")) return true;
+    const [h, m] = game.time.split(":").map(Number);
+    // Margem de 15 min (jogo que começou há pouco ainda aparece)
+    return (h > currentHour) || (h === currentHour && m >= currentMin - 15);
+  });
 }
 
 // ═══════════════════════════════════════════════════════
@@ -82,8 +118,6 @@ const MODELS = [
   "gemini-2.0-flash-lite",
 ];
 
-let keyIndex = 0;
-
 function getApiKeys() {
   return [
     process.env.GEMINI_API_KEY,
@@ -100,7 +134,6 @@ async function callGemini(prompt) {
   const maxAttempts = MODELS.length * keys.length;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    // Tenta todas as chaves com cada modelo antes de trocar modelo
     const model = MODELS[Math.floor(attempt / keys.length) % MODELS.length];
     const apiKey = keys[attempt % keys.length];
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
@@ -121,7 +154,6 @@ async function callGemini(prompt) {
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         console.error(`[ERRO] ${model} key${Math.floor(attempt / MODELS.length)}: ${res.status} - ${err?.error?.message || "?"}`);
-        // Qualquer erro → tenta próximo modelo/chave
         const wait = res.status === 429 ? 3000 : 1000;
         await new Promise(r => setTimeout(r, wait));
         continue;
@@ -156,11 +188,12 @@ export async function POST(request) {
   try {
     const { marketId, marketLabel, marketDesc, date } = await request.json();
 
-    // 1. CACHE DO SUPABASE
+    // 1. CACHE DO SUPABASE (válido até fim do dia)
     const cached = await getFromCache(marketId, date);
     if (cached) {
       console.log(`[CACHE HIT] ${marketId}::${date}`);
-      return Response.json({ predictions: cached, fromCache: true });
+      const filtered = filterFutureGames(cached, date);
+      return Response.json({ predictions: filtered, fromCache: true });
     }
 
     // 2. RATE LIMIT
@@ -174,15 +207,20 @@ export async function POST(request) {
 
     console.log(`[CACHE MISS] ${marketId}::${date} — chamando API... (${getApiKeys().length} chaves, ${MODELS.length} modelos)`);
 
-    // 3. PROMPT
+    // 3. PROMPT — pede apenas jogos futuros
+    const brasilia = getBrasiliaTime();
+    const currentHour = String(brasilia.getHours()).padStart(2, "0");
+    const currentMin = String(brasilia.getMinutes()).padStart(2, "0");
+
     const prompt = `Você é um analista especialista em apostas esportivas de futebol. Sua tarefa é analisar os jogos de futebol reais que acontecem na data ${date} e avaliar quais têm a maior probabilidade para o mercado "${marketLabel}" (${marketDesc}).
 
 INSTRUÇÕES:
 1. Pesquise os jogos de futebol confirmados para ${date} nas principais ligas (Premier League, La Liga, Serie A, Bundesliga, Ligue 1, Brasileirão, Champions League, Eredivisie, Liga Portugal, Copa do Brasil, Libertadores, MLS, etc.)
-2. Para cada jogo, analise: histórico recente dos times, gols marcados/sofridos, confrontos diretos, forma como mandante/visitante, desfalques
-3. Selecione os 5 a 10 jogos com MAIOR probabilidade para o mercado "${marketLabel}"
-4. Para cada jogo, estime uma porcentagem de chance realista (entre 55% e 95%)
-5. Os horários devem estar no fuso de Brasília (GMT-3)
+2. IMPORTANTE: Inclua APENAS jogos que ainda NÃO começaram. O horário atual em Brasília é ${currentHour}:${currentMin}. NÃO inclua jogos com horário anterior a este.
+3. Para cada jogo, analise: histórico recente dos times, gols marcados/sofridos, confrontos diretos, forma como mandante/visitante, desfalques
+4. Selecione os 5 a 10 jogos com MAIOR probabilidade para o mercado "${marketLabel}"
+5. Para cada jogo, estime uma porcentagem de chance realista (entre 55% e 95%)
+6. Os horários devem estar no fuso de Brasília (GMT-3)
 
 IMPORTANTE: Responda APENAS com um JSON válido, sem nenhum texto antes ou depois, sem markdown. O formato deve ser exatamente:
 [
@@ -203,8 +241,8 @@ IMPORTANTE: Responda APENAS com um JSON válido, sem nenhum texto antes ou depoi
 ]
 
 Regras:
-- APENAS jogos reais confirmados para ${date}
-- Se não houver jogos nesta data, retorne []
+- APENAS jogos reais confirmados para ${date} que AINDA NÃO COMEÇARAM
+- Se não houver jogos futuros nesta data, retorne []
 - Ordene do maior para menor chance
 - Cada item de analysis deve conter dados/estatísticas reais
 - Retorne SOMENTE o JSON`;
@@ -253,14 +291,16 @@ Regras:
       })
       .sort((a, b) => b.chance - a.chance);
 
-    // 6. SALVAR NO SUPABASE
+    // 6. SALVAR NO CACHE (todos os jogos, filtro aplica na leitura)
     await setCache(marketId, date, predictions);
     console.log(`[CACHE SET] ${marketId}::${date} — ${predictions.length} jogos`);
 
-    // 7. LIMPAR CACHE VELHO (1 em cada 10 requests)
+    // 7. LIMPAR CACHE VELHO
     if (Math.random() < 0.1) cleanOldCache();
 
-    return Response.json({ predictions });
+    // 8. RETORNAR SÓ JOGOS FUTUROS
+    const filtered = filterFutureGames(predictions, date);
+    return Response.json({ predictions: filtered });
   } catch (error) {
     console.error("Prediction error:", error);
     return Response.json(

@@ -307,7 +307,7 @@ function BestMarketsTab({ predictions, dateOff, onPick, loading }) {
    ═══════════════════════════════════════════════════════════ */
 function Dashboard({ user, onLogout }) {
   const [tab, setTab] = useState("mercados");
-  const [market, setMarket] = useState("over15");
+  const [market, setMarket] = useState(null);
   const [category, setCategory] = useState("todos");
   const [dateOff, setDateOff] = useState(0);
   const [expanded, setExpanded] = useState(null);
@@ -369,9 +369,20 @@ function Dashboard({ user, onLogout }) {
     setLoading(false);
   }, [allPreds]);
 
+  // Só busca quando o usuário clica em um mercado
+  const selectMarket = useCallback((mktId) => {
+    setMarket(mktId);
+    fetchPredictions(mktId, dateOff);
+  }, [dateOff, fetchPredictions]);
+
+  // Quando muda o dia, busca de novo se tiver mercado selecionado
   useEffect(() => {
-    fetchPredictions(market, dateOff);
-  }, [market, dateOff, fetchPredictions]);
+    if (market) {
+      fetchPredictions(market, dateOff);
+    } else {
+      setPreds([]);
+    }
+  }, [dateOff]);
 
   const filtered = category === "todos"
     ? MARKETS
@@ -479,7 +490,7 @@ function Dashboard({ user, onLogout }) {
             predictions={allPreds}
             dateOff={dateOff}
             loading={false}
-            onPick={(id) => { setMarket(id); setTab("mercados"); }}
+            onPick={(id) => { selectMarket(id); setTab("mercados"); }}
           />
         )}
 
@@ -505,7 +516,7 @@ function Dashboard({ user, onLogout }) {
               {filtered.map(m => {
                 const active = market === m.id;
                 return (
-                  <button key={m.id} onClick={() => setMarket(m.id)} style={{
+                  <button key={m.id} onClick={() => selectMarket(m.id)} style={{
                     padding: "12px 6px", borderRadius: 12,
                     border: `1.5px solid ${active ? C.ac + "66" : C.bd}`,
                     background: active ? C.acd : C.card,
@@ -524,7 +535,22 @@ function Dashboard({ user, onLogout }) {
             </div>
 
             {/* Header */}
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+            {!market && (
+              <div style={{
+                padding: "40px 20px", borderRadius: 14, background: C.card,
+                border: `1px solid ${C.bd}`, textAlign: "center",
+              }}>
+                <span style={{ fontSize: 40 }}>👆</span>
+                <p style={{ color: C.tx, fontSize: 15, fontWeight: 700, marginTop: 12 }}>
+                  Selecione um mercado acima
+                </p>
+                <p style={{ color: C.txd, fontSize: 12, marginTop: 6 }}>
+                  Toque em um mercado para a IA buscar os melhores jogos do dia
+                </p>
+              </div>
+            )}
+
+            {market && <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
               <div>
                 <h2 style={{ margin: 0, fontSize: 17, fontWeight: 800, color: C.tx }}>
                   {cur?.icon} {cur?.label}
@@ -539,10 +565,10 @@ function Dashboard({ user, onLogout }) {
                   border: `1px solid ${C.bd}`, fontSize: 11, fontWeight: 700, color: C.txd,
                 }}>{preds.length} jogos</span>
               )}
-            </div>
+            </div>}
 
             {/* Loading */}
-            {loading && (
+            {market && loading && (
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "50px 0" }}>
                 <div style={{
                   width: 40, height: 40, border: `3px solid ${C.bd}`,
@@ -558,7 +584,7 @@ function Dashboard({ user, onLogout }) {
             )}
 
             {/* Error */}
-            {error && !loading && (
+            {market && error && !loading && (
               <div style={{
                 padding: "20px", borderRadius: 14, background: C.redd,
                 border: `1px solid ${C.red}33`, textAlign: "center",
@@ -573,7 +599,7 @@ function Dashboard({ user, onLogout }) {
             )}
 
             {/* Games */}
-            {!loading && !error && (
+            {market && !loading && !error && (
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 {preds.map(g => (
                   <GameCard
