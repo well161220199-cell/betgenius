@@ -252,6 +252,8 @@ Regras:
 
     // 5. PARSEAR
     let clean = text.trim().replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+    // Remover caracteres de controle que quebram JSON
+    clean = clean.replace(/[\x00-\x1F\x7F]/g, (ch) => ch === '\n' || ch === '\r' || ch === '\t' ? ' ' : '');
     let predictions;
 
     try {
