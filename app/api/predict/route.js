@@ -250,22 +250,74 @@ Regras:
     // 4. CHAMAR API
     const text = await callGemini(prompt);
 
-    // 5. PARSEAR
+    // 5. PARSEAR (robusto — lida com JSON malformado)
     let clean = text.trim().replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-    // Remover caracteres de controle que quebram JSON
+    // Remover caracteres de controle
     clean = clean.replace(/[\x00-\x1F\x7F]/g, (ch) => ch === '\n' || ch === '\r' || ch === '\t' ? ' ' : '');
+    
     let predictions;
 
-    try {
-      predictions = JSON.parse(clean);
-    } catch (e) {
+    // Tentar extrair o array JSON de várias formas
+    function tryParse(str) {
+      try { return JSON.parse(str); } catch { return null; }
+    }
+
+    // Tentativa 1: parse direto
+    predictions = tryParse(clean);
+
+    // Tentativa 2: extrair array do texto
+    if (!predictions) {
       const match = clean.match(/\[[\s\S]*\]/);
-      if (match) {
-        predictions = JSON.parse(match[0]);
-      } else {
-        console.error("Parse failed:", clean.substring(0, 300));
-        return Response.json({ error: "Erro ao processar resposta da IA" }, { status: 500 });
+      if (match) predictions = tryParse(match[0]);
+    }
+
+    // Tentativa 3: corrigir aspas simples para duplas
+    if (!predictions) {
+      const fixed = clean.replace(/'/g, '"');
+      const match2 = fixed.match(/\[[\s\S]*\]/);
+      if (match2) predictions = tryParse(match2[0]);
+    }
+
+    // Tentativa 4: corrigir trailing commas
+    if (!predictions) {
+      const noTrailing = clean.replace(/,\s*([}\]])/g, '$1');
+      const match3 = noTrailing.match(/\[[\s\S]*\]/);
+      if (match3) predictions = tryParse(match3[0]);
+    }
+
+    // Tentativa 5: forçar limpeza pesada
+    if (!predictions) {
+      let heavy = clean;
+      // Extrair só o array
+      const start = heavy.indexOf('[');
+      const end = heavy.lastIndexOf(']');
+      if (start !== -1 && end !== -1) {
+        heavy = heavy.substring(start, end + 1);
+        // Corrigir problemas comuns
+        heavy = heavy.replace(/,\s*([}\]])/g, '$1');
+        heavy = heavy.replace(/([{,]\s*)(\w+)\s*:/g, '$1"$2":');
+        predictions = tryParse(heavy);
       }
+    }
+
+    // Tentativa 6: JSON truncado — cortar no último objeto completo
+    if (!predictions) {
+      const start = clean.indexOf('[');
+      if (start !== -1) {
+        let truncated = clean.substring(start);
+        // Encontrar o último "}" completo
+        const lastBrace = truncated.lastIndexOf('}');
+        if (lastBrace !== -1) {
+          truncated = truncated.substring(0, lastBrace + 1) + ']';
+          truncated = truncated.replace(/,\s*\]$/g, ']');
+          predictions = tryParse(truncated);
+        }
+      }
+    }
+
+    if (!predictions) {
+      console.error("Parse failed after all attempts:", clean.substring(0, 500));
+      return Response.json({ error: "Resposta da IA veio incompleta. Clique em Tentar novamente." }, { status: 500 });
     }
 
     if (!Array.isArray(predictions)) predictions = [];
