@@ -147,7 +147,7 @@ async function callGemini(prompt) {
         body: JSON.stringify({
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           tools: [{ googleSearch: {} }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
+          generationConfig: { temperature: 0.6, maxOutputTokens: 16384 },
         }),
       });
 
@@ -207,45 +207,68 @@ export async function POST(request) {
 
     console.log(`[CACHE MISS] ${marketId}::${date} — chamando API... (${getApiKeys().length} chaves, ${MODELS.length} modelos)`);
 
-    // 3. PROMPT — pede apenas jogos futuros
+    // 3. PROMPT — muito mais detalhado
     const brasilia = getBrasiliaTime();
     const currentHour = String(brasilia.getHours()).padStart(2, "0");
     const currentMin = String(brasilia.getMinutes()).padStart(2, "0");
+    const todayStr = brasilia.toISOString().split("T")[0];
+    const isToday = date === todayStr;
 
-    const prompt = `Você é um analista especialista em apostas esportivas de futebol. Sua tarefa é analisar os jogos de futebol reais que acontecem na data ${date} e avaliar quais têm a maior probabilidade para o mercado "${marketLabel}" (${marketDesc}).
+    const timeFilter = isToday
+      ? `FILTRO DE HORÁRIO: O horário atual em Brasília é ${currentHour}:${currentMin}. Inclua APENAS jogos com horário POSTERIOR a ${currentHour}:${currentMin}. Não inclua jogos já iniciados ou encerrados.`
+      : `Inclua TODOS os jogos confirmados para ${date}, sem filtro de horário.`;
 
-INSTRUÇÕES:
-1. Pesquise os jogos de futebol confirmados para ${date} nas principais ligas (Premier League, La Liga, Serie A, Bundesliga, Ligue 1, Brasileirão, Champions League, Eredivisie, Liga Portugal, Copa do Brasil, Libertadores, MLS, etc.)
-2. IMPORTANTE: Inclua APENAS jogos que ainda NÃO começaram. O horário atual em Brasília é ${currentHour}:${currentMin}. NÃO inclua jogos com horário anterior a este.
-3. Para cada jogo, analise: histórico recente dos times, gols marcados/sofridos, confrontos diretos, forma como mandante/visitante, desfalques
-4. Selecione os 5 a 10 jogos com MAIOR probabilidade para o mercado "${marketLabel}"
-5. Para cada jogo, estime uma porcentagem de chance realista (entre 55% e 95%)
-6. Os horários devem estar no fuso de Brasília (GMT-3)
+    const prompt = `Você é o principal analista de apostas esportivas de futebol do mundo. Use o Google Search para pesquisar os jogos REAIS confirmados para ${date}.
 
-IMPORTANTE: Responda APENAS com um JSON válido, sem nenhum texto antes ou depois, sem markdown. O formato deve ser exatamente:
+TAREFA: Analisar jogos de futebol do dia ${date} para o mercado "${marketLabel}" (${marketDesc}).
+
+PASSO 1 — PESQUISE OS JOGOS:
+Busque jogos confirmados para ${date} em TODAS estas ligas e competições:
+- Europa: Premier League, La Liga, Serie A, Bundesliga, Ligue 1, Eredivisie, Liga Portugal, Championship, Serie B Itália, Segunda División
+- Copas Europeias: Champions League, Europa League, Conference League
+- América do Sul: Brasileirão Série A e B, Copa do Brasil, Libertadores, Sul-Americana, Liga Argentina, Liga Colombiana
+- Outros: MLS, Liga MX, J-League, K-League, Saudi Pro League, Superliga Turca, Liga Grega
+- Amistosos e Seleções (se houver)
+
+${timeFilter}
+
+PASSO 2 — ANALISE CADA JOGO:
+Para cada jogo encontrado, analise especificamente para o mercado "${marketLabel}":
+- Média de gols marcados e sofridos nos últimos 5 jogos de cada time
+- Resultado dos últimos 3 confrontos diretos entre os times
+- Performance como mandante vs visitante (últimos 5 jogos)
+- Jogadores importantes lesionados ou suspensos
+- Posição na tabela e momento atual (sequência de vitórias/derrotas)
+
+PASSO 3 — SELECIONE OS MELHORES:
+Escolha os 8 a 12 jogos com MAIOR probabilidade para "${marketLabel}".
+Se houver menos de 8 jogos no dia, inclua todos que tiverem chance acima de 55%.
+
+FORMATO DE RESPOSTA — Responda SOMENTE com JSON válido, sem texto antes ou depois:
 [
   {
-    "home": "Time da Casa",
-    "away": "Time Visitante",
-    "league": "Nome da Liga",
-    "flag": "emoji da bandeira do país da liga",
+    "home": "Nome Completo Time Casa",
+    "away": "Nome Completo Time Visitante",
+    "league": "Nome da Liga/Competição",
+    "flag": "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
     "time": "HH:MM",
     "chance": 82,
     "analysis": [
-      "Estatística real relevante 1",
-      "Estatística real relevante 2",
-      "Estatística real relevante 3",
-      "Estatística real relevante 4"
+      "Dado estatístico específico com números (ex: 'Time X marcou em 8 dos últimos 10 jogos')",
+      "Confronto direto com resultado (ex: 'Últimos 3 confrontos: 2V 1E, média 3.2 gols')",
+      "Performance recente (ex: 'Time Y sofreu gol em 7 dos últimos 8 jogos fora')",
+      "Fator decisivo (ex: 'Jogador X artilheiro com 15 gols, confirmado no time titular')"
     ]
   }
 ]
 
-Regras:
-- APENAS jogos reais confirmados para ${date} que AINDA NÃO COMEÇARAM
-- Se não houver jogos futuros nesta data, retorne []
+REGRAS OBRIGATÓRIAS:
+- Somente jogos REAIS e CONFIRMADOS para ${date}
+- Horários no fuso de Brasília (GMT-3)
+- Chance entre 55% e 95% (seja realista)
+- Cada analysis DEVE ter dados com NÚMEROS REAIS, não frases genéricas
 - Ordene do maior para menor chance
-- Cada item de analysis deve conter dados/estatísticas reais
-- Retorne SOMENTE o JSON`;
+- Retorne SOMENTE o array JSON, sem explicações`;
 
     // 4. CHAMAR API
     const text = await callGemini(prompt);
@@ -325,7 +348,7 @@ Regras:
     predictions = predictions
       .filter(p => p.home && p.away && p.chance)
       .map((p, i) => {
-        const chance = Math.min(95, Math.max(55, Number(p.chance) || 65));
+        const chance = Math.min(95, Math.max(50, Number(p.chance) || 65));
         return {
           id: marketId + "-" + i,
           home: p.home || "Time A",
@@ -334,7 +357,7 @@ Regras:
           flag: p.flag || "⚽",
           time: p.time || "00:00",
           chance,
-          conf: chance >= 82 ? "alta" : chance >= 70 ? "media" : "normal",
+          conf: chance >= 80 ? "alta" : chance >= 65 ? "media" : "normal",
           analysis: Array.isArray(p.analysis) ? p.analysis.slice(0, 4) : [
             "Análise baseada em dados estatísticos",
             "Histórico de confrontos diretos",
